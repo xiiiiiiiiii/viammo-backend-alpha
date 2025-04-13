@@ -44,8 +44,47 @@ def get_viator_destinations():
         print(f"Unexpected error fetching destinations: {e}")
         return None
 
+def get_viator_tags_en():
+    """
+    Call the Viator destinations endpoint
+        
+    Returns:
+        dict: JSON response from the Viator API
+    """
+    try:
+        # API endpoint
+        url = "https://api.viator.com/partner/products/tags"
+        
+        # Headers
+        headers = {
+            "Accept": "application/json;version=2.0",
+            "Accept-Language": "en-US",
+            "exp-api-key": os.getenv("VIATOR_API_KEY")
+        }
+        
+        # Make the request
+        response = requests.get(url, headers=headers)
+        
+        # Check if request was successful
+        if response.status_code == 200:
+            tags = response.json()
+            tags_en = {
+                tag['tagId']: tag['allNamesByLocale']['en']
+                for tag in tags['tags']
+            }
+            return tags_en
+        else:
+            print(f"Error: {response.status_code}")
+            print(response.text)
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch destinations: {e}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error fetching destinations: {e}")
+        return None
 
-def get_viator_products(destination_id, page_size=50):
+def get_viator_products(destination_id, tags_en, page_size=50):
     """
     Call the Viator products search endpoint
         
@@ -92,6 +131,16 @@ def get_viator_products(destination_id, page_size=50):
         if response.status_code == 200:
             data = response.json()
             products = data.get('products', [])
+
+            # Add tag strings to products
+            products = [
+                {
+                    **p,
+                    'tags_str': [tags_en[tag] for tag in p['tags']],
+                }
+                for p in products
+            ]
+
             all_products.extend(products)
             
             # Update total count if not already set
@@ -239,14 +288,19 @@ def main():
         if page_size != args.page_size:
             print(f"Adjusting page size to {page_size} (must be between 1 and 50)")
         
-        products = get_viator_products(location_id, page_size)
+        tags_en = get_viator_tags_en()
+        if not tags_en:
+            print("Failed to retrieve tags. Please check your API key and network connection.")
+            return
+        
+        products = get_viator_products(location_id, tags_en, page_size)
         if not products:
             print("Failed to retrieve products. Please check your API key and network connection.")
             return
         
         print(f"\nFound {len(products['products'])} products")
         for i, p in enumerate(products['products']):
-            print(f"{i+1}. {p['title']}")
+            print(f"{i+1}. {p['title']} {p['tags_str']}")
 
         
         # Save to MongoDB
