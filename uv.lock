@@ -306,6 +306,23 @@ wheels = [
 ]
 
 [[package]]
+name = "groq"
+version = "0.23.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a6/b1/653567a92d876e3e52cdce6780ac3f6dfec5101b6c81a577e3c5abddeebe/groq-0.23.1.tar.gz", hash = "sha256:952e34895f9bfb78ab479e495d77b32180262e5c42f531ce3a1722d6e5a04dfb", size = 125359 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ae/9a/54948664261f707a24377ee7e280dbca52b7265fce8613c52dae0cbf5cf5/groq-0.23.1-py3-none-any.whl", hash = "sha256:05fa38c3d0ad03c19c6185f98f6a73901c2a463e844fd067b79f7b05c8346946", size = 127351 },
+]
+
+[[package]]
 name = "h11"
 version = "0.14.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1058,6 +1075,7 @@ dependencies = [
     { name = "google-api-python-client" },
     { name = "google-auth-httplib2" },
     { name = "google-auth-oauthlib" },
+    { name = "groq" },
     { name = "langchain" },
     { name = "langchain-openai" },
     { name = "pymongo" },
@@ -1071,6 +1089,7 @@ requires-dist = [
     { name = "google-api-python-client" },
     { name = "google-auth-httplib2" },
     { name = "google-auth-oauthlib" },
+    { name = "groq" },
     { name = "langchain", specifier = ">=0.3.21" },
     { name = "langchain-openai", specifier = ">=0.3.10" },
     { name = "pymongo", specifier = ">=4.11.3" },

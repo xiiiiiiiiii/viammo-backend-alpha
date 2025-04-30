@@ -2,3 +2,7 @@ data/.DS_Store
 .env
 /.ipynb_checkpoints
 token.pickle
+hotel_reservation_emails.jsonl
+full_hotel_reservation_emails.jsonl
+full_hotel_reservation_emails_body_checked.jsonl
+hotel_reservation_key_insights.jsonl

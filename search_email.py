@@ -3,14 +3,25 @@ import pickle
 import base64
 import json
 import re
+import datetime
 from html import unescape
+from dotenv import load_dotenv
+from threading import Lock
+import concurrent.futures
+
+import time
+import tempfile
+from typing import List, Dict, Any, Optional
+
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from dotenv import load_dotenv
+from googleapiclient.http import HttpError
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+
+from groq import Groq
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +31,24 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 CLIENT_ID = os.getenv('GOOGLE_CLOUD_GMAIL_CLIENT_ID')
 CLIENT_SECRET = os.getenv('GOOGLE_CLOUD_GMAIL_CLIENT_SECRET')
 TOKEN_FILE = 'token.pickle'
+MAX_CONCURRENCY = 10
+
+def load_jsonl(file_path):
+    with open(file_path, 'r') as f:
+        return [json.loads(line) for line in f]
+
+def save_to_jsonl(file_path, a_list):
+    # Create directory if it doesn't exist
+    dirname = os.path.dirname(file_path)
+    if len(dirname.strip()) > 0:
+        os.makedirs(dirname, exist_ok=True)
+
+    # Save to JSONL file
+    with open(file_path, 'w') as f:
+        for item in a_list:
+            f.write(json.dumps(item) + '\n')
+
+    print(f"Saved {len(a_list)} records to {file_path}")
 
 def get_gmail_service():
     """Get authenticated Gmail service."""
@@ -58,114 +87,225 @@ def get_gmail_service():
     # Build and return Gmail service
     return build('gmail', 'v1', credentials=creds)
 
-def search_emails(service, query):
-    """Search for emails matching the query."""
-    result = service.users().messages().list(userId='me', q=query).execute()
-    messages = result.get('messages', [])
+def search_emails(service, query, max_results=500):
+    """Search for emails matching the query.
     
-    return messages
+    Args:
+        service: Authenticated Gmail API service instance.
+        query: String used to filter messages matching specific criteria.
+        max_results: Maximum number of results to return (default 500)
+        
+    Returns:
+        List of messages that match the criteria
+    """
+    try:
+        # Initialize empty list for messages and nextPageToken
+        messages = []
+        next_page_token = None
+        
+        # Keep fetching pages until all results are retrieved or max_results is reached
+        while True:
+            # Request a page of results
+            result = service.users().messages().list(
+                userId='me',
+                q=query,
+                pageToken=next_page_token,
+                maxResults=min(max_results - len(messages), 100)  # Gmail API allows max 100 per request
+            ).execute()
+            
+            # Get messages from this page
+            page_messages = result.get('messages', [])
+            if not page_messages:
+                break
+                
+            # Add messages to our list
+            messages.extend(page_messages)
+            print(f"Retrieved {len(messages)} emails so far...")
+            
+            # Check if we've reached the desired number of results
+            if len(messages) >= max_results:
+                print(f"Reached maximum of {max_results} results")
+                break
+                
+            # Get token for next page or exit if no more pages
+            next_page_token = result.get('nextPageToken')
+            if not next_page_token:
+                break
+        
+        return messages
+        
+    except Exception as error:
+        print(f"An error occurred: {error}")
+        return []
 
-def get_email_details(service, msg_id):
-    """Get email details for a message ID."""
-    message = service.users().messages().get(userId='me', id=msg_id).execute()
+def get_email_metadatas_batch(msg_ids):
+    """Get email metadata for multiple message IDs in a batch request."""
+    results = []
+    results_lock = Lock()
     
-    headers = message['payload']['headers']
-    subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
-    sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
-    date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown Date')
-    
-    # Extract email body using a recursive approach to handle different email structures
-    plain_text = ""
-    
-    def get_text_from_part(part):
-        """Recursively extract text from email parts."""
-        if part.get('mimeType') == 'text/plain' and 'data' in part.get('body', {}):
-            return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
-        
-        # If the part has a body with data, but is HTML, extract plain text from HTML
-        html_content = ""
-        if part.get('mimeType') == 'text/html' and 'data' in part.get('body', {}):
-            html = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
-            # Extract text from HTML using regex to remove tags
-            html_text = extract_text_from_html(html)
-            html_content = html_text
-        
-        # Check for nested parts
-        if 'parts' in part:
-            for subpart in part['parts']:
-                text = get_text_from_part(subpart)
-                if text:
-                    return text
-        
-        return html_content
-    
-    def extract_text_from_html(html):
-        """Extract plain text from HTML content."""
-        # Remove HTML tags
-        text = re.sub(r'<[^>]+>', ' ', html)
-        # Decode HTML entities
-        text = unescape(text)
-        # Replace multiple whitespace with single space
-        text = re.sub(r'\s+', ' ', text)
-        # Remove leading/trailing whitespace
-        text = text.strip()
-        return text
-    
-    # Handle case where content is directly in the payload
-    if 'data' in message['payload'].get('body', {}):
-        content = base64.urlsafe_b64decode(message['payload']['body']['data']).decode('utf-8')
-        # Check if content is HTML
-        if message['payload'].get('mimeType') == 'text/html':
-            plain_text = extract_text_from_html(content)
-        else:
-            plain_text = content
-    # Handle case with parts
-    elif 'parts' in message['payload']:
-        plain_text = get_text_from_part(message['payload'])
-    
-    # If still empty, use the snippet as a fallback
-    if not plain_text:
-        plain_text = f"[Could not extract body. Snippet: {message['snippet']}]"
-    
-    return {
-        'id': msg_id,
-        'subject': subject,
-        'sender': sender,
-        'date': date,
-        'snippet': message['snippet'],
-        'body': plain_text
-    }
+    def fetch_single_message(msg_id, idx):
+        """Process a single message and return its metadata."""
+        try:
+            service = get_gmail_service()
 
-def get_all_email_datas(service, messages, max_words_total_limit=523788, email_count_limit=None):
-    messages = messages[:email_count_limit] if email_count_limit else messages
-    email_datas = []
-    total_word_count = 0
-    for i, message in enumerate(messages):
-        email_data = get_email_details(service, message['id'])
+            response = service.users().messages().get(
+                userId='me',
+                id=msg_id,
+                format='metadata',
+                metadataHeaders=['Subject', 'From', 'To', 'Date', 'Reply-To', 'CC', 'BCC', 'In-Reply-To']
+            ).execute()
         
-        # Count words in this email (subject, snippet, and body)
-        approx_word_count = int(len(str(email_data)) / 7.0)
-        
-        # Check if adding this email would exceed the word limit
-        if total_word_count + approx_word_count > max_words_total_limit:
-            print(f"Reached word limit after processing {i} of {len(messages)} emails.")
-            print(f"Total word count: {total_word_count}/{max_words_total_limit}")
-            break
-        
-        # Add email data and update word count
-        email_datas.append(email_data)
-        total_word_count += approx_word_count
-        
-        # Print progress every 5 emails
-        if i % 5 == 0:
-            print(f"Processed {i+1}/{len(messages)} emails. Word count: {total_word_count}/{max_words_total_limit}")
-    
-    print(f"Final email count: {len(email_datas)}/{len(messages)}")
-    print(f"Final word count: {total_word_count}/{max_words_total_limit}")
-    
-    return email_datas
+            # Process the response the same way as the individual method
+            headers = response['payload']['headers']
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+            date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown Date')
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
+            recipient = next((h['value'] for h in headers if h['name'] == 'To'), 'Unknown Recipient')
+            reply_to = next((h['value'] for h in headers if h['name'] == 'Reply-To'), 'Unknown Reply-To')
+            cc = next((h['value'] for h in headers if h['name'] == 'CC'), 'Unknown CC')
+            bcc = next((h['value'] for h in headers if h['name'] == 'BCC'), 'Unknown BCC')
+            in_reply_to = next((h['value'] for h in headers if h['name'] == 'In-Reply-To'), 'Unknown In-Reply-To')
+            
+            email_metadata = {
+                'id': msg_id,
+                'subject': subject,
+                'date': date,
+                'sender': sender,
+                'recipient': recipient,
+                'reply_to': reply_to,
+                'cc': cc,
+                'bcc': bcc,
+                'in_reply_to': in_reply_to,
+            }
 
-def generate_trips_metadatas(trip_message_datas, num_trips, openai_api_key) -> str:
+            with results_lock:
+                results.append(email_metadata)
+            
+            if (idx + 1) % 10 == 0:
+                print(f"Fetched {idx+1} email metadatas...")
+            
+            return email_metadata
+        
+        except HttpError as error:
+            print(f"Error fetching message {msg_id}: {error}")
+            return None
+    
+    # results = [fetch_single_message(msg_id, idx) for idx, msg_id in enumerate(msg_ids)]
+
+    # Create a thread pool with limited concurrency
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+        # Submit all tasks to the executor
+        futures = {executor.submit(fetch_single_message, msg_id, idx): msg_id for idx, msg_id in enumerate(msg_ids)}
+        
+        # Process results as they complete (optional)
+        for future in concurrent.futures.as_completed(futures):
+            msg_id = futures[future]
+            try:
+                # This will re-raise any exceptions from the task
+                future.result()
+            except Exception as exc:
+                print(f"Message {msg_id} generated an exception: {exc}")
+    
+    return results
+
+def get_full_email_batch(msg_ids):
+    """Get full email for multiple message IDs in a batch request."""
+    results = []
+    results_lock = Lock()
+    
+    def fetch_single_full_message(msg_id, idx):
+        """Process a single message and return its metadata."""
+        try:
+            service = get_gmail_service()
+
+            response = service.users().messages().get(
+                userId='me',
+                id=msg_id,
+                format='full'
+            ).execute()
+        
+            # Process the response the same way as the individual method
+            headers = response['payload']['headers']
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+            date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown Date')
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
+            recipient = next((h['value'] for h in headers if h['name'] == 'To'), 'Unknown Recipient')
+            reply_to = next((h['value'] for h in headers if h['name'] == 'Reply-To'), 'Unknown Reply-To')
+            cc = next((h['value'] for h in headers if h['name'] == 'CC'), 'Unknown CC')
+            bcc = next((h['value'] for h in headers if h['name'] == 'BCC'), 'Unknown BCC')
+            in_reply_to = next((h['value'] for h in headers if h['name'] == 'In-Reply-To'), 'Unknown In-Reply-To')
+
+            def extract_text_from_html(html):
+                """Extract plain text from HTML content."""
+                # Remove HTML tags
+                text = re.sub(r'<[^>]+>', ' ', html)
+                # Decode HTML entities
+                text = unescape(text)
+                # Replace multiple whitespace with single space
+                text = re.sub(r'\s+', ' ', text)
+                # Remove leading/trailing whitespace
+                text = text.strip()
+                return text
+
+            def get_text_from_part(part):
+                """Recursively extract text from email parts."""
+                if part.get('mimeType') == 'text/plain' and 'data' in part.get('body', {}):
+                    return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+                if part.get('mimeType') == 'text/html' and 'data' in part.get('body', {}):
+                    html = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+                    return extract_text_from_html(html)
+                if 'parts' in part:  # Check for nested parts
+                    subpart_texts = [get_text_from_part(subpart) for subpart in part['parts']]
+                    subpart_texts = [subpart_text for subpart_text in subpart_texts if subpart_text is not None]
+                    return ' '.join(subpart_texts)
+
+            body = get_text_from_part(response['payload'])
+            body = body if body else "Unknown body"
+            
+            email_metadata = {
+                'id': msg_id,
+                'subject': subject,
+                'date': date,
+                'sender': sender,
+                'recipient': recipient,
+                'reply_to': reply_to,
+                'cc': cc,
+                'bcc': bcc,
+                'in_reply_to': in_reply_to,
+                'body': body,
+            }
+
+            with results_lock:
+                results.append(email_metadata)
+            
+            if (idx + 1) % 10 == 0:
+                print(f"Fetched {idx+1} email metadatas...")
+            
+            return email_metadata
+        
+        except HttpError as error:
+            print(f"Error fetching message {msg_id}: {error}")
+            return None
+    
+    # results = [fetch_single_full_message(msg_id, idx) for idx, msg_id in enumerate(msg_ids[:10])]
+
+    # Create a thread pool with limited concurrency
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+        # Submit all tasks to the executor
+        futures = {executor.submit(fetch_single_full_message, msg_id, idx): msg_id for idx, msg_id in enumerate(msg_ids)}
+        
+        # Process results as they complete (optional)
+        for future in concurrent.futures.as_completed(futures):
+            msg_id = futures[future]
+            try:
+                # This will re-raise any exceptions from the task
+                future.result()
+            except Exception as exc:
+                print(f"Message {msg_id} generated an exception: {exc}")
+    
+    return results
+
+def generate_trip_insights(trip_message_datas, openai_api_key, existing_trip_insights = "") -> str:
     """
     Returns a list of trip information JSON objects.
     """
@@ -182,10 +322,80 @@ def generate_trips_metadatas(trip_message_datas, num_trips, openai_api_key) -> s
         
         # Define a prompt template for hotel characteristics
         template = """
-        Based on the following travel labeled email messages, please analyze the typical patterns of the user's travel preferences
-        and a list of trip json objects with up to {num_trips} trip objects like the one below corresponding to the user's travel preferences.
-        Please only return valid JSON and nothing else - no explanations or text before or after the JSON. Please only use the json fields
-        that are present in the example trip json objects below - don't add extra json fields, add extra info in notes field for example.
+        Based on the following hotel reservation email messages, please analyze the typical patterns of the user's travel preferences
+        and generate a list of types of trips that the user has taken. For each type of trip, include the following key information:
+        - destination
+        - time of year, e.g. ski week, spring break, summer, end of year holidays, Thanksgiving, Memorial Day, Labor Day, etc.
+        - length of the trip
+        - number of guests and type of guests
+        - number of times the user did a similar trip
+        - likely purpose of the trip
+        - total budget, also add total budget with $ signs, e.g. "$$$$",  "$$$", "$$", "$", etc. with "$$$$" being the highest budget.
+        - preferred hotel
+        - preferred hotel chains
+        - preferred hotel characteristics
+        - preferred room types
+        - preferred amenities
+        - preferred activities
+        - preferred dining experiences.
+        - preferred payment method
+        - key details from each trip in this trip type
+        - any other information that would be helpful for a travel planner to know.
+
+        A trip type should contain at least 3 trips.
+
+        Return just list of the types of trips and their key information (as highlighted above).
+
+        Here is the existing trip insights you have already started to generate:
+        {existing_trip_insights}
+
+        Here are the new hotel reservation emails you need to analyze:
+        {trip_message_datas}
+        """
+        
+        prompt = ChatPromptTemplate.from_template(template)
+        
+        # Generate the response
+        chain = prompt | llm
+        response = chain.invoke({
+            "existing_trip_insights": existing_trip_insights,
+            "trip_message_datas": trip_message_datas
+        })
+
+        # Extract JSON from the response
+        response_content = response.content
+        if not response_content:
+            print(f"LLM did not return a response to generate trip insights")
+            return None
+        
+        return response_content
+            
+    except ImportError:
+        print("Warning: LangChain or OpenAI packages not installed. Skipping keyword generation.")
+        print("To install required packages: pip install langchain langchain-openai")
+        return None
+
+def generate_trips_metadatas(trip_message_datas, trip_insights, num_trips, openai_api_key) -> str:
+    """
+    Returns a list of trip information JSON objects.
+    """
+
+    if not openai_api_key:
+        print("Warning: OPENAI_API_KEY environment variable not set. Skipping LLM keyword extraction.")
+        return None
+    
+    try:        
+        llm_model = "o4-mini"
+        
+        # Initialize the LLM with the API key explicitly
+        llm = ChatOpenAI(model=llm_model, openai_api_key=openai_api_key)
+        
+        # Define a prompt template for hotel characteristics
+        template = """
+        Based on the following hotel reservation email messages and the following trip insights, please analyze the typical patterns of the user's
+        travel preferences and a list of trip json objects with up to {num_trips} trip objects like the one below corresponding to the user's travel
+        preferences. Please only return valid JSON and nothing else - no explanations or text before or after the JSON. Please only use the json
+        fields that are present in the example trip json objects below - don't add extra json fields, add extra info in notes field for example.
 
         Make sure to find and account for the following information in the trip json objects:
         - preferred destinations
@@ -223,6 +433,9 @@ def generate_trips_metadatas(trip_message_datas, num_trips, openai_api_key) -> s
             }}
         ]
 
+        Here are the trip insights you have already generated:
+        {trip_insights}
+
         Trip message datas:
         {trip_message_datas}
         """
@@ -233,6 +446,7 @@ def generate_trips_metadatas(trip_message_datas, num_trips, openai_api_key) -> s
         chain = prompt | llm
         response = chain.invoke({
             "trip_message_datas": trip_message_datas,
+            "trip_insights": trip_insights,
             "num_trips": num_trips
         })
 
@@ -257,48 +471,272 @@ def generate_trips_metadatas(trip_message_datas, num_trips, openai_api_key) -> s
         print("To install required packages: pip install langchain langchain-openai")
         return None
 
+def run_groq_inference(prompt):
+    groq_client = Groq()
+    completion = groq_client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            },
+        ],
+        temperature=0.6,
+        max_completion_tokens=128,
+        top_p=1.0,
+        stream=False,
+        stop=None,
+    )
+    return completion.choices[0].message.content
+
+def batch_llm_calls(
+    prompts: Dict[str, str],
+    model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
+    system_message: Optional[str] = None,
+    poll_interval: int = 5,
+    additional_params: Optional[Dict[str, Any]] = None
+) -> List[str]:
+    """
+    Process a batch of prompts using Groq's Batch API and return results as a list.
+    
+    Args:
+        prompts: List of prompts/questions to send to the LLM
+        model: The model to use (default: "meta-llama/llama-4-scout-17b-16e-instruct")
+        system_message: Optional system message to prepend to each prompt
+        poll_interval: How often to check status (in seconds) when waiting
+        additional_params: Optional additional parameters for each request
+        
+    Returns:
+        List of completion strings in the same order as the input prompts
+    """
+    # Initialize Groq client
+    client = Groq()
+    
+    # Validate inputs
+    if not prompts:
+        raise ValueError("Must provide a list of prompts to create a new batch job")
+    
+    # Create temporary JSONL batch file
+    with tempfile.NamedTemporaryFile(mode='w+', suffix='.jsonl', delete=False) as temp_file:
+        temp_filename = temp_file.name
+        
+        for prompt_id, prompt in prompts.items():
+            # Prepare messages for this prompt
+            messages = []
+            if system_message:
+                messages.append({"role": "system", "content": system_message})
+            messages.append({"role": "user", "content": prompt})
+            
+            # Create request body with model and messages
+            body = {
+                "model": model,
+                "messages": messages
+            }
+            
+            # Add any additional parameters
+            if additional_params:
+                body.update(additional_params)
+            
+            # Create the full request with an auto-generated ID
+            request = {
+                "custom_id": prompt_id,
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": body
+            }
+            
+            # Write the request as a single line in JSONL format
+            temp_file.write(json.dumps(request) + "\n")
+    
+    try:
+        # Upload the temporary file
+        with open(temp_filename, "rb") as f:
+            file_response = client.files.create(
+                file=f,
+                purpose="batch"
+            )
+        
+        # Create the batch job
+        batch_response = client.batches.create(
+            completion_window="24h",
+            endpoint="/v1/chat/completions",
+            input_file_id=file_response.id
+        )
+        batch_id = batch_response.id
+        print(f"Batch job created with ID: {batch_id}")
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+    
+    # Wait for the job to complete
+    print(f"Waiting for batch job {batch_id} to complete...")
+    while True:
+        response = client.batches.retrieve(batch_id)
+        status = response.status
+        print(f"Batch job status: {status}.")
+        
+        if status in ["completed", "expired", "cancelled"]:
+            break
+
+        time.sleep(poll_interval)
+    
+    # Process results
+    batch_results = response.to_dict()
+    output_file_id = batch_results["output_file_id"]
+    actual_responses_obj = client.files.content(output_file_id)
+    actual_responses_obj.write_to_file("temp_batch_results.jsonl")
+    with open('temp_batch_results.jsonl', 'r', encoding='utf-8') as f:
+        raw_results = [json.loads(line) for line in f if line.strip()]
+    os.remove("temp_batch_results.jsonl")
+
+    results = {
+        result["custom_id"]: result["response"]["body"]["choices"][0]["message"]["content"]
+        for result in raw_results
+    }
+
+    return results
+
 def main():
-    DISPLAY_LIMIT = 30
-    NUM_TRIPS_METADATA_TO_GENERATE = 3
-    MAX_IN_CONTEXT_WORDS = 64000
+    DISPLAY_LIMIT = 20
+    NUM_TRIPS_METADATA_TO_GENERATE = 5
+    # MAX_IN_CONTEXT_WORDS = 64000
 
-    print("Authenticating with Gmail...")
-    service = get_gmail_service()
-    
-    print("Searching for emails with 'travel' label...")
-    query = "label:travel"
-    messages = search_emails(service, query)
-    
-    if not messages:
-        print("No matching emails found.")
-        return
-    
-    print(f"Found {len(messages)} matching emails.")
+    hotel_reservation_search_keywords = load_jsonl('hotel_reservation_search_keywords.jsonl')
+    hotel_reservation_search_keywords = [f'"{keyword}"' for keyword in hotel_reservation_search_keywords]
+    query = ' OR '.join(hotel_reservation_search_keywords)
 
-    print(f"Getting email data...")
-    email_datas = get_all_email_datas(service, messages, max_words_total_limit=MAX_IN_CONTEXT_WORDS, email_count_limit=None)
-    print(f"Fetched {len(email_datas)} email datas (capped at so total context below {MAX_IN_CONTEXT_WORDS} words).")
+    if not os.path.exists('hotel_reservation_emails.jsonl'):
+        print("Authenticating with Gmail...")
+        service = get_gmail_service()
+        
+        print("Searching for emails...")
+        # query = "label:travel" # Autogenerated google search label, misses a lot of emails...
+        query = """
+        ("Reservation Confirmation" OR "Booking Confirmation" OR "Booking Reference" OR "Confirmation Number" OR "Reservation Number" OR "Hotel Confirmation") -in:chats
+        """
+        messages = search_emails(service, query, max_results=5000)
+        if not messages:
+            print("No matching emails found.")
+            return
+        print(f"Found {len(messages)} matching emails.")
+
+        print(f"Getting email metadatas...")
+        msg_ids = [message['id'] for message in messages]
+        email_metadatas = get_email_metadatas_batch(msg_ids)
+        print(f"Retrieved {len(email_metadatas)} email metadatas before filtering.")
+
+        email_metadatas = [email_metadata for email_metadata in email_metadatas if "Unknown" in email_metadata['in_reply_to']]
+        print(f"Filtered down to {len(email_metadatas)} by removing emails that are replies to another email in the same thread.")
+
+        prompts = {
+            email_metadata['id']: f"Here is metadata for an email, is it a hotel reservation confirmation? Just answer True or False and nothing else. Metadata: {email_metadata}"
+            for email_metadata in email_metadatas
+        }
+        batch_hotel_reservation_classification = batch_llm_calls(prompts)
+        hotel_reservation_emails = [
+            email_metadata
+            for email_metadata in email_metadatas
+            if "True" == batch_hotel_reservation_classification.get(email_metadata['id'], 'False')
+        ]
+        save_to_jsonl('hotel_reservation_emails.jsonl', hotel_reservation_emails)
+    else:
+        hotel_reservation_emails = load_jsonl('hotel_reservation_emails.jsonl')
+
+    if not os.path.exists('full_hotel_reservation_emails.jsonl'):
+        msg_ids = [message['id'] for message in hotel_reservation_emails]
+        full_hotel_reservation_emails = get_full_email_batch(msg_ids)
+        save_to_jsonl('full_hotel_reservation_emails.jsonl', full_hotel_reservation_emails)
+    else:
+        full_hotel_reservation_emails = load_jsonl('full_hotel_reservation_emails.jsonl')
+    
+    print(f"Filtered down to {len(full_hotel_reservation_emails)} potential hotel reservation emails based on subject and other metadata.")
+
+
+    if not os.path.exists('full_hotel_reservation_emails_body_checked.jsonl'):
+        prompts = {
+            email_metadata['id']: f"Here is data for an email, is it a hotel reservation confirmation? Make sure to only keep hotel reservations (and filter out restaurant reservations and other travel related emails). Just answer True or False and nothing else. Metadata: {email_metadata}"
+            for email_metadata in full_hotel_reservation_emails
+        }
+        batch_hotel_reservation_classification_full_email = batch_llm_calls(prompts)
+        body_checked_filtered_hotel_reservation_emails = [
+            email_metadata
+            for email_metadata in full_hotel_reservation_emails
+            if "True" == batch_hotel_reservation_classification_full_email.get(email_metadata['id'], 'False')
+        ]
+        save_to_jsonl('full_hotel_reservation_emails_body_checked.jsonl', body_checked_filtered_hotel_reservation_emails)
+    else:
+        body_checked_filtered_hotel_reservation_emails = load_jsonl('full_hotel_reservation_emails_body_checked.jsonl')
+
+    print(f"Filtered down to {len(body_checked_filtered_hotel_reservation_emails)} potential hotel reservation emails based on full email data including body.")
+
+    if not os.path.exists('hotel_reservation_key_insights.jsonl'):
+        prompts = {
+            email_metadata['id']: f""""
+            Here is data for a hotel reservation email. Please extract key insights from the email:
+            - hotel name
+            - check-in, check-out dates, month of year, season of year, is this a ski-week trip? a spring break trip? a summer trip? etc.
+            - location of the hotel, e.g. city, state, country, etc. what type of area is it? a beach, a mountain, a city, a town, etc.
+            - number of and age of guests
+            - total price, price per night, price per room, price per guest, etc.
+            - is the guest a type of loyalty program member of a hotel chain? What membership level?
+            - payment method (credit, debit, points, promotion, etc.)
+            - type of room or suite, views, great and unusual amenities like beach front, pool, gym, michelin dining, etc. (and obvious ones like free wifi, etc.)
+            - special requests made by guests (e.g. roses on arrival, baby crib, etc.)
+            - probable purpose of the trip: use the room type and number of guests to infer the purpose of the trip, e.g. business, family, couple, etc. 2 queen beds and 2 adults probably isn't a couple's getaway.
+            - any other key insights that would be helpful for a travel planner to know.
+
+            Email data:
+            {email_metadata}"
+            """
+            for email_metadata in body_checked_filtered_hotel_reservation_emails
+        }
+        batch_hotel_reservation_key_insights = batch_llm_calls(prompts, model="meta-llama/llama-4-maverick-17b-128e-instruct")
+        hotel_reservation_key_insights = [
+            {
+                **email_metadata,
+                'key_insights': batch_hotel_reservation_key_insights.get(email_metadata['id'], '')
+            }
+            for email_metadata in body_checked_filtered_hotel_reservation_emails
+        ]
+        save_to_jsonl('hotel_reservation_key_insights.jsonl', hotel_reservation_key_insights)
+    else:
+        hotel_reservation_key_insights = load_jsonl('hotel_reservation_key_insights.jsonl')
 
     print("-" * 80)
-    for email_data in email_datas[:DISPLAY_LIMIT]:
+    for email_data in hotel_reservation_key_insights[:DISPLAY_LIMIT]:
         print(f"{email_data['subject']}")
+        print(f"   Id: {email_data['id']}")
         print(f"   From: {email_data['sender']}")
         print(f"   Date: {email_data['date']}")
-        print(f"   Snippet: {email_data['snippet']}")
+        print(f"   To: {email_data['recipient']}")
+        print(f"   Reply-To: {email_data['reply_to']}")
+        print(f"   CC: {email_data['cc']}")
+        print(f"   BCC: {email_data['bcc']}")
+        print(f"   In-Reply-To: {email_data['in_reply_to']}")
+        print(f"   Key Insights: {email_data['key_insights']}")
         print("-" * 80)
         print()
 
+    # Remove body from the email metadata since we extracted the key insights and we want to reduce token llm count.
+    hotel_reservation_key_insights = [
+        {
+            **{k: v for k, v in email_metadata.items() if k != "body"},
+        }
+        for email_metadata in hotel_reservation_key_insights
+    ]
+
+    print(f"Generating insights from hotel confirmation emails...")
+    trip_insights = generate_trip_insights(hotel_reservation_key_insights, os.getenv("OPENAI_API_KEY"), existing_trip_insights = "")
+    print(f"trip_insights:\n{trip_insights}")
+
     print(f"Generating up to {NUM_TRIPS_METADATA_TO_GENERATE} trip metadatas...")
-    trip_jsons = generate_trips_metadatas(email_datas, NUM_TRIPS_METADATA_TO_GENERATE, os.getenv("OPENAI_API_KEY"))
-    
+    trip_jsons = generate_trips_metadatas(hotel_reservation_key_insights, trip_insights, NUM_TRIPS_METADATA_TO_GENERATE, os.getenv("OPENAI_API_KEY"))
     # Pretty print the trip JSON data
     if trip_jsons:
         print("\n=== Generated Trip Metadata ===\n")
         print(json.dumps(trip_jsons, indent=4))
         print("\n=============================\n")
-    
-    if len(messages) > DISPLAY_LIMIT:
-        print(f"...and {len(messages) - DISPLAY_LIMIT} more results")
 
 if __name__ == "__main__":
     main()
