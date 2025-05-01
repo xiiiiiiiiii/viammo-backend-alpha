@@ -322,27 +322,37 @@ def generate_trip_insights(trip_message_datas, openai_api_key, existing_trip_ins
         
         # Define a prompt template for hotel characteristics
         template = """
-        Based on the following hotel reservation email messages, please analyze the typical patterns of the user's travel preferences
-        and generate a list of types of trips that the user has taken. For each type of trip, include the following key information:
+        Based on the following hotel reservation email messages and the existing trip insights, please analyze the typical patterns of
+        the user's travel preferences and generate a list of types of trips that the user has taken. For each type of trip, include the
+        following key information:
         - destination
         - time of year, e.g. ski week, spring break, summer, end of year holidays, Thanksgiving, Memorial Day, Labor Day, etc.
         - length of the trip
-        - number of guests and type of guests
+        - number of guests and type of guests, e.g. adults, children, infants, etc.
         - number of times the user did a similar trip
         - likely purpose of the trip
-        - total budget, also add total budget with $ signs, e.g. "$$$$",  "$$$", "$$", "$", etc. with "$$$$" being the highest budget.
-        - preferred hotel
-        - preferred hotel chains
-        - preferred hotel characteristics
-        - preferred room types
-        - preferred amenities
-        - preferred activities
-        - preferred dining experiences.
-        - preferred payment method
+        - total budget with $ signs, e.g. "$$$$",  "$$$", "$$", "$", etc. with "$$$$" being the highest budget.
+        - preferred hotel, keep specifics e.g. "Hilton Honolulu", "Hyatt Waikiki", "St. Regis San Francisco", etc.
+        - preferred hotel chains, keep specifics e.g. "Hilton", "Marriott", "Hyatt", "St. Regis", "Rosewood", "Relais & Chateaux", "Four Seasons", "Leading Hotels of the World", etc.
+        - preferred hotel characteristics, keep specifics e.g. "family friendly", "ski-in-ski-out", "beach front", "pool", "gym", "spa", "free Wi-Fi", "free breakfast", "free airport shuttle", "free parking", etc.
+        - preferred room types, keep specifics e.g. "1 King bed Suite", "1 room with King bed and 1 room with 2 queens", "2 Queen beds", "Crib", "Pool view", "Garden view", "Ocean view", "Mountain view", etc.
+        - preferred amenities, keep specifics e.g. "ski-in-ski-out", "beach front", "pool", "gym", "spa", "free Wi-Fi", "free breakfast", "free airport shuttle", "free parking", etc.
+        - preferred activities, keep specifics e.g. "skiing", "snowboarding", "hiking", "surfing", "golfing", "scuba diving", "snorkeling", "water sports", "etc."
+        - preferred dining experiences, keep specifics e.g. "fine dining", "casual dining", "cafe", "pub", "italian", "japanese", "mexican", "etc."
+        - preferred payment method, keep specifics e.g. "credit card", "debit card", "hyatt points", "marriott points", "etc."
         - key details from each trip in this trip type
         - any other information that would be helpful for a travel planner to know.
 
-        A trip type should contain at least 3 trips.
+        Try to generate 5-10 trip types with at least 3 trips per trip type unless you don't have enough trips. If you don't have enough
+        trips, start by creating trip types based off of individual trips.
+
+        If you already have generated some trip insights, please add new trip types or merge existing trip types. When merging trip type
+        information, make sure to keep track of the total number of days for all trips in that trip type, and any other salient details.
+        Rank your trip types with a higher total number of days and total number of trips higher in your list. Keep the number of trip types
+        between below or equal to 10.
+
+        You're output should be a self-sufficient list of trip types and their key information (not just an addition to an existing list
+        of trip insights).
 
         Return just list of the types of trips and their key information (as highlighted above).
 
@@ -385,7 +395,7 @@ def generate_trips_metadatas(trip_message_datas, trip_insights, num_trips, opena
         return None
     
     try:        
-        llm_model = "o4-mini"
+        llm_model = "o4-mini"  # Reasoning capabilities are important for this task (e.g. "2 Queen beds probably isn't a couple's getaway purpose trip.")
         
         # Initialize the LLM with the API key explicitly
         llm = ChatOpenAI(model=llm_model, openai_api_key=openai_api_key)
@@ -393,9 +403,10 @@ def generate_trips_metadatas(trip_message_datas, trip_insights, num_trips, opena
         # Define a prompt template for hotel characteristics
         template = """
         Based on the following hotel reservation email messages and the following trip insights, please analyze the typical patterns of the user's
-        travel preferences and a list of trip json objects with up to {num_trips} trip objects like the one below corresponding to the user's travel
-        preferences. Please only return valid JSON and nothing else - no explanations or text before or after the JSON. Please only use the json
-        fields that are present in the example trip json objects below - don't add extra json fields, add extra info in notes field for example.
+        travel preferences and generate a list of great future possile trips as a json list of distionaries with up to {num_trips} trip objects like
+        the one below corresponding to the user's travel preferences. Please only return valid JSON and nothing else - no explanations or text before
+        or after the JSON. Please only use the json fields that are present in the example trip json objects below - don't add extra json fields, add
+        extra info in notes field for example. Make sure the dates are in the future and correspond to the preferred destinations.
 
         Make sure to find and account for the following information in the trip json objects:
         - preferred destinations
@@ -417,8 +428,8 @@ def generate_trips_metadatas(trip_message_datas, trip_insights, num_trips, opena
         [
             {{
                 "name": "Tahoe Family",
-                "startDate": "2025-04-18T07:00:00.000Z",
-                "endDate": "2025-04-21T07:00:00.000Z",
+                "startDate": "2026-02-18T07:00:00.000Z",
+                "endDate": "2026-02-21T07:00:00.000Z",
                 "destination": {{
                     "city": "Palisades Tahoe",
                     "state": "CA",
@@ -600,7 +611,7 @@ def batch_llm_calls(
 def main():
     DISPLAY_LIMIT = 20
     NUM_TRIPS_METADATA_TO_GENERATE = 5
-    # MAX_IN_CONTEXT_WORDS = 64000
+    HOTEL_RESERVATION_EMAILS_BATCH_SIZE = 20
 
     hotel_reservation_search_keywords = load_jsonl('hotel_reservation_search_keywords.jsonl')
     hotel_reservation_search_keywords = [f'"{keyword}"' for keyword in hotel_reservation_search_keywords]
@@ -726,12 +737,33 @@ def main():
         for email_metadata in hotel_reservation_key_insights
     ]
 
-    print(f"Generating insights from hotel confirmation emails...")
-    trip_insights = generate_trip_insights(hotel_reservation_key_insights, os.getenv("OPENAI_API_KEY"), existing_trip_insights = "")
-    print(f"trip_insights:\n{trip_insights}")
+    # print(f"Generating insights from hotel confirmation emails...")
+    # trip_insights = ""
+    # trip_insights = generate_trip_insights(hotel_reservation_key_insights, os.getenv("OPENAI_API_KEY"), existing_trip_insights = trip_insights)
+    # print(f"trip_insights:\n{trip_insights}")
+
+    # If too much data for context window, split into batches, and cycle through them while accumulating insights.
+    print(f"\nGenerating insights from hotel confirmation emails...\n")
+    trip_insights = ""
+    num_batches = (len(hotel_reservation_key_insights) + HOTEL_RESERVATION_EMAILS_BATCH_SIZE - 1) // HOTEL_RESERVATION_EMAILS_BATCH_SIZE
+    for i in range(0, len(hotel_reservation_key_insights), HOTEL_RESERVATION_EMAILS_BATCH_SIZE):
+        current_batch = hotel_reservation_key_insights[i:i + HOTEL_RESERVATION_EMAILS_BATCH_SIZE]
+        batch_num = i // HOTEL_RESERVATION_EMAILS_BATCH_SIZE + 1
+        print(f"Processing batch {batch_num}/{num_batches} ({len(current_batch)} emails)...")
+
+        # Call generate_trip_insights with the current batch and existing insights
+        trip_insights = generate_trip_insights(
+            current_batch,
+            os.getenv("OPENAI_API_KEY"),
+            existing_trip_insights=trip_insights  # Pass the accumulated insights
+        )
+
+        print(f"Processed batch {batch_num}/{num_batches} ({len(current_batch)} emails), current trip insights:\n{trip_insights}\n")
+
 
     print(f"Generating up to {NUM_TRIPS_METADATA_TO_GENERATE} trip metadatas...")
-    trip_jsons = generate_trips_metadatas(hotel_reservation_key_insights, trip_insights, NUM_TRIPS_METADATA_TO_GENERATE, os.getenv("OPENAI_API_KEY"))
+    # hotel_reservation_key_insights # If too much data for context window, just send summarized trip_insights, works pretty well.
+    trip_jsons = generate_trips_metadatas([], trip_insights, NUM_TRIPS_METADATA_TO_GENERATE, os.getenv("OPENAI_API_KEY"))
     # Pretty print the trip JSON data
     if trip_jsons:
         print("\n=== Generated Trip Metadata ===\n")
