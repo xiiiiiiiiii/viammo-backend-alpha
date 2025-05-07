@@ -143,7 +143,7 @@ def get_email_metadatas_batch(msg_ids):
     results = []
     results_lock = Lock()
     
-    def fetch_single_message(msg_id, idx):
+    def fetch_single_message(msg_id, idx, len_emails):
         """Process a single message and return its metadata."""
         try:
             service = get_gmail_service()
@@ -182,7 +182,7 @@ def get_email_metadatas_batch(msg_ids):
                 results.append(email_metadata)
             
             if (idx + 1) % 10 == 0:
-                print(f"Fetched {idx+1} email metadatas...")
+                print(f"Fetched {idx+1} / {len_emails} email metadatas...")
             
             return email_metadata
         
@@ -195,7 +195,8 @@ def get_email_metadatas_batch(msg_ids):
     # Create a thread pool with limited concurrency
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
         # Submit all tasks to the executor
-        futures = {executor.submit(fetch_single_message, msg_id, idx): msg_id for idx, msg_id in enumerate(msg_ids)}
+        len_emails = len(msg_ids)
+        futures = {executor.submit(fetch_single_message, msg_id, idx, len_emails): msg_id for idx, msg_id in enumerate(msg_ids)}
         
         # Process results as they complete (optional)
         for future in concurrent.futures.as_completed(futures):
@@ -482,10 +483,10 @@ def generate_trips_metadatas(trip_message_datas, trip_insights, num_trips, opena
         print("To install required packages: pip install langchain langchain-openai")
         return None
 
-def run_groq_inference(prompt):
+def run_groq_inference(prompt, model):
     groq_client = Groq()
     completion = groq_client.chat.completions.create(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        model=model,
         messages=[
             {
                 "role": "user",
@@ -500,13 +501,28 @@ def run_groq_inference(prompt):
     )
     return completion.choices[0].message.content
 
+def get_all_email_data_groq(
+    prompts: Dict[str, str],
+    model: str
+) -> Dict[str, str]:
+    """
+    Process a batch of prompts using Groq's Batch API and return results as a list.
+    """
+    results = {}
+    for prompt_id, prompt in prompts.items():
+        response = run_groq_inference(prompt, model=model)
+        results[prompt_id] = response
+        print(f"Completed {len(results)} / {len(prompts)} prompts.")
+
+    return results
+
 def batch_llm_calls(
     prompts: Dict[str, str],
     model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
     system_message: Optional[str] = None,
     poll_interval: int = 5,
     additional_params: Optional[Dict[str, Any]] = None
-) -> List[str]:
+) -> Dict[str, str]:
     """
     Process a batch of prompts using Groq's Batch API and return results as a list.
     
@@ -608,6 +624,55 @@ def batch_llm_calls(
 
     return results
 
+def run_groq_inference_batch_with_pool(
+    prompts_dict,
+    max_workers=10,
+    model="meta-llama/llama-4-scout-17b-16e-instruct",
+    ):
+    """Process multiple prompts with Groq API using a thread pool."""
+    results = {}
+    results_lock = Lock() # To safely update the shared results dictionary
+    completed_count = 0
+    total_prompts = len(prompts_dict)
+
+    def process_single_prompt(prompt_id, prompt_text):
+        nonlocal completed_count
+        try:
+            response = run_groq_inference(prompt_text, model=model) # Your existing inference function
+            with results_lock:
+                results[prompt_id] = response
+                completed_count += 1
+                print(f"Completed {completed_count} / {total_prompts} prompts (ID: {prompt_id}).")
+            return prompt_id, response
+        except Exception as e:
+            with results_lock:
+                results[prompt_id] = f"ERROR: {str(e)}"
+                completed_count += 1
+                print(f"Error processing prompt ID {prompt_id}: {e}. Completed {completed_count} / {total_prompts}.")
+            return prompt_id, f"ERROR: {str(e)}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit tasks: executor.submit(function, arg1, arg2, ...)
+        future_to_prompt_id = {executor.submit(process_single_prompt, pid, ptext): pid for pid, ptext in prompts_dict.items()}
+
+        for future in concurrent.futures.as_completed(future_to_prompt_id):
+            prompt_id_completed = future_to_prompt_id[future]
+            try:
+                # You can get the result of the task if needed, 
+                # but it's already stored in the `results` dict by the worker function.
+                # This also re-raises any exception that occurred during the task.
+                future.result() 
+            except Exception as exc:
+                # This exception should ideally already be caught and logged by process_single_prompt
+                # But it's good practice to handle it here as well.
+                print(f'Prompt ID {prompt_id_completed} generated an exception in future: {exc}')
+                # Ensure error is stored if not already
+                with results_lock:
+                    if prompt_id_completed not in results:
+                         results[prompt_id_completed] = f"ERROR: {str(exc)}"
+
+    return results
+
 def main():
     DISPLAY_LIMIT = 20
     NUM_TRIPS_METADATA_TO_GENERATE = 5
@@ -617,7 +682,7 @@ def main():
     hotel_reservation_search_keywords = [f'"{keyword}"' for keyword in hotel_reservation_search_keywords]
     query = ' OR '.join(hotel_reservation_search_keywords)
 
-    if not os.path.exists('hotel_reservation_emails.jsonl'):
+    if not os.path.exists('./email_data/v0/hotel_reservation_emails.jsonl'):
         print("Authenticating with Gmail...")
         service = get_gmail_service()
         
@@ -639,49 +704,58 @@ def main():
 
         email_metadatas = [email_metadata for email_metadata in email_metadatas if "Unknown" in email_metadata['in_reply_to']]
         print(f"Filtered down to {len(email_metadatas)} by removing emails that are replies to another email in the same thread.")
-
+        save_to_jsonl('./email_data/v0/hotel_reservation_emails.jsonl', email_metadatas)
+    else:
+        email_metadatas = load_jsonl('./email_data/v0/hotel_reservation_emails.jsonl')
+        print(f"Loaded {len(email_metadatas)} email metadatas from file.")
+    
+    if not os.path.exists('./email_data/v0/hotel_reservation_emails_classification.jsonl'):
         prompts = {
             email_metadata['id']: f"Here is metadata for an email, is it a hotel reservation confirmation? Just answer True or False and nothing else. Metadata: {email_metadata}"
             for email_metadata in email_metadatas
         }
-        batch_hotel_reservation_classification = batch_llm_calls(prompts)
+        # batch_hotel_reservation_classification = batch_llm_calls(prompts)
+        batch_hotel_reservation_classification = run_groq_inference_batch_with_pool(prompts)
         hotel_reservation_emails = [
             email_metadata
             for email_metadata in email_metadatas
             if "True" == batch_hotel_reservation_classification.get(email_metadata['id'], 'False')
         ]
-        save_to_jsonl('hotel_reservation_emails.jsonl', hotel_reservation_emails)
+        save_to_jsonl('./email_data/v0/hotel_reservation_emails_classification.jsonl', hotel_reservation_emails)
     else:
-        hotel_reservation_emails = load_jsonl('hotel_reservation_emails.jsonl')
+        hotel_reservation_emails = load_jsonl('./email_data/v0/hotel_reservation_emails_classification.jsonl')
+        print(f"Loaded {len(hotel_reservation_emails)} hotel reservation emails from file.")
 
-    if not os.path.exists('full_hotel_reservation_emails.jsonl'):
+    if not os.path.exists('./email_data/v0/full_hotel_reservation_emails.jsonl'):
         msg_ids = [message['id'] for message in hotel_reservation_emails]
         full_hotel_reservation_emails = get_full_email_batch(msg_ids)
-        save_to_jsonl('full_hotel_reservation_emails.jsonl', full_hotel_reservation_emails)
+        save_to_jsonl('./email_data/v0/full_hotel_reservation_emails.jsonl', full_hotel_reservation_emails)
     else:
-        full_hotel_reservation_emails = load_jsonl('full_hotel_reservation_emails.jsonl')
-    
+        full_hotel_reservation_emails = load_jsonl('./email_data/v0/full_hotel_reservation_emails.jsonl')
+        print(f"Loaded {len(full_hotel_reservation_emails)} full hotel reservation emails from file.")
     print(f"Filtered down to {len(full_hotel_reservation_emails)} potential hotel reservation emails based on subject and other metadata.")
 
 
-    if not os.path.exists('full_hotel_reservation_emails_body_checked.jsonl'):
+    if not os.path.exists('./email_data/v0/full_hotel_reservation_emails_body_checked.jsonl'):
         prompts = {
             email_metadata['id']: f"Here is data for an email, is it a hotel reservation confirmation? Make sure to only keep hotel reservations (and filter out restaurant reservations and other travel related emails). Just answer True or False and nothing else. Metadata: {email_metadata}"
             for email_metadata in full_hotel_reservation_emails
         }
-        batch_hotel_reservation_classification_full_email = batch_llm_calls(prompts)
+        # batch_hotel_reservation_classification_full_email = batch_llm_calls(prompts)
+        batch_hotel_reservation_classification_full_email = run_groq_inference_batch_with_pool(prompts)
         body_checked_filtered_hotel_reservation_emails = [
             email_metadata
             for email_metadata in full_hotel_reservation_emails
             if "True" == batch_hotel_reservation_classification_full_email.get(email_metadata['id'], 'False')
         ]
-        save_to_jsonl('full_hotel_reservation_emails_body_checked.jsonl', body_checked_filtered_hotel_reservation_emails)
+        save_to_jsonl('./email_data/v0/full_hotel_reservation_emails_body_checked.jsonl', body_checked_filtered_hotel_reservation_emails)
     else:
-        body_checked_filtered_hotel_reservation_emails = load_jsonl('full_hotel_reservation_emails_body_checked.jsonl')
+        body_checked_filtered_hotel_reservation_emails = load_jsonl('./email_data/v0/full_hotel_reservation_emails_body_checked.jsonl')
+        print(f"Loaded {len(body_checked_filtered_hotel_reservation_emails)} body checked filtered hotel reservation emails from file.")
 
     print(f"Filtered down to {len(body_checked_filtered_hotel_reservation_emails)} potential hotel reservation emails based on full email data including body.")
 
-    if not os.path.exists('hotel_reservation_key_insights.jsonl'):
+    if not os.path.exists('./email_data/v0/hotel_reservation_key_insights.jsonl'):
         prompts = {
             email_metadata['id']: f""""
             Here is data for a hotel reservation email. Please extract key insights from the email:
@@ -702,7 +776,8 @@ def main():
             """
             for email_metadata in body_checked_filtered_hotel_reservation_emails
         }
-        batch_hotel_reservation_key_insights = batch_llm_calls(prompts, model="meta-llama/llama-4-maverick-17b-128e-instruct")
+        # batch_hotel_reservation_key_insights = batch_llm_calls(prompts, model="meta-llama/llama-4-maverick-17b-128e-instruct")
+        batch_hotel_reservation_key_insights = run_groq_inference_batch_with_pool(prompts, model="meta-llama/llama-4-maverick-17b-128e-instruct")
         hotel_reservation_key_insights = [
             {
                 **email_metadata,
@@ -710,10 +785,10 @@ def main():
             }
             for email_metadata in body_checked_filtered_hotel_reservation_emails
         ]
-        save_to_jsonl('hotel_reservation_key_insights.jsonl', hotel_reservation_key_insights)
+        save_to_jsonl('./email_data/v0/hotel_reservation_key_insights.jsonl', hotel_reservation_key_insights)
     else:
-        hotel_reservation_key_insights = load_jsonl('hotel_reservation_key_insights.jsonl')
-
+        hotel_reservation_key_insights = load_jsonl('./email_data/v0/hotel_reservation_key_insights.jsonl')
+        print(f"Loaded {len(hotel_reservation_key_insights)} hotel reservation key insights from file.")
     print("-" * 80)
     for email_data in hotel_reservation_key_insights[:DISPLAY_LIMIT]:
         print(f"{email_data['subject']}")
