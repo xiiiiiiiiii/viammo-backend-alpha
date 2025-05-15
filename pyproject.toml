@@ -14,5 +14,8 @@ dependencies = [
     "google-api-python-client",
     "google-auth-httplib2",
     "google-auth-oauthlib",
-    "groq"
+    "groq",
+    "flask",
+    "flask_cors",
+    "cryptography"
 ]
